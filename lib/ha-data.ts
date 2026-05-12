@@ -16,8 +16,8 @@ import {
   type RoomHistoryPoint,
 } from "./growbox-types"
 
-const HA_URL = process.env.NEXT_PUBLIC_HA_URL ?? "https://ryzzla.org"
-const HA_TOKEN = process.env.NEXT_PUBLIC_HA_TOKEN ?? ""
+const HA_URL = process.env.HA_URL ?? "https://ryzzla.org"
+const HA_TOKEN = process.env.HA_TOKEN ?? "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIyNjFlMGFjYzM0ZDI0OGI3OTZkNTZmYjIzNzQ1MjI4MiIsImlhdCI6MTc3ODYyNTA2OSwiZXhwIjoyMDkzOTg1MDY5fQ.AasjvaITuNUksPPlCnpSuAPpaD4KqOyWoC36w5a_gC0"
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
