@@ -1,11 +1,8 @@
 /**
- * Home Assistant Live Data Fetcher
- * Replaces generateMockData() / generateRoomData() with real HA REST API calls.
+ * Home Assistant Live Data
  *
- * Entity mapping:
- *  BLOOM  → sensor.hygrometer2_temperature / sensor.hygrometer2_humidity
- *  VEGIE  → sensor.hygrometer1_temperature / sensor.hygrometer1_humidity
- *  SHARED → sensor.pwm2_growbox_co2, sensor.hygrometera_temperature, etc.
+ * Alle Requests gehen über /api/ha (Vercel-Proxy).
+ * Kein direkter Browser→HA-Zugriff, kein CORS, kein Token im Frontend.
  */
 
 import {
@@ -16,49 +13,45 @@ import {
   type RoomHistoryPoint,
 } from "./growbox-types"
 
-const HA_URL = process.env.HA_URL ?? "https://ryzzla.org"
-const HA_TOKEN = process.env.HA_TOKEN ?? "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIyNjFlMGFjYzM0ZDI0OGI3OTZkNTZmYjIzNzQ1MjI4MiIsImlhdCI6MTc3ODYyNTA2OSwiZXhwIjoyMDkzOTg1MDY5fQ.AasjvaITuNUksPPlCnpSuAPpaD4KqOyWoC36w5a_gC0"
+// ── Proxy-Helpers ─────────────────────────────────────────────────────────────
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-async function getState(entityId: string): Promise<string> {
+async function getStates(
+  ids: string[]
+): Promise<Record<string, { state: string; attributes: Record<string, unknown> }>> {
   try {
-    const res = await fetch(`${HA_URL}/api/states/${entityId}`, {
-      headers: { Authorization: `Bearer ${HA_TOKEN}`, "Content-Type": "application/json" },
+    const res = await fetch(`/api/ha?entities=${ids.join(",")}`, {
       cache: "no-store",
     })
-    if (!res.ok) return "unavailable"
-    const json = await res.json()
-    return json.state ?? "unavailable"
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return res.json()
   } catch {
-    return "unavailable"
+    return Object.fromEntries(ids.map((id) => [id, { state: "unavailable", attributes: {} }]))
   }
 }
 
-function num(val: string, fallback = 0): number {
-  const n = parseFloat(val)
-  return isNaN(n) ? fallback : n
+async function getAttributes(id: string): Promise<Record<string, unknown>> {
+  try {
+    const res = await fetch(`/api/ha?entity=${id}`, { cache: "no-store" })
+    if (!res.ok) return {}
+    const json = await res.json()
+    return json.attributes ?? {}
+  } catch {
+    return {}
+  }
 }
 
-// Fetch 24 h history for an entity and map to HistoryDataPoint shape
 async function fetchHistory(
   entityId: string,
   valueKey: keyof HistoryDataPoint
 ): Promise<Partial<HistoryDataPoint>[]> {
   try {
-    const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-    const res = await fetch(
-      `${HA_URL}/api/history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&significant_changes_only=false`,
-      {
-        headers: { Authorization: `Bearer ${HA_TOKEN}` },
-        cache: "no-store",
-      }
-    )
+    const from = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    const res = await fetch(`/api/ha?history=${entityId}&from=${encodeURIComponent(from)}`, {
+      cache: "no-store",
+    })
     if (!res.ok) return []
-    const json: { state: string; last_changed: string }[][] = await res.json()
-    const series = json[0] ?? []
+    const series: { state: string; last_changed: string }[] = await res.json()
 
-    // Bucket into 24 hourly slots
     const buckets: Record<string, number[]> = {}
     for (const point of series) {
       const v = parseFloat(point.state)
@@ -71,14 +64,17 @@ async function fetchHistory(
 
     return Object.entries(buckets).map(([time, vals]) => ({
       time,
-      [valueKey]: parseFloat((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1)),
+      [valueKey]: parseFloat(
+        (vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1)
+      ),
     }))
   } catch {
     return []
   }
 }
 
-// Merge partial history arrays (temp + humidity + etc.) into full HistoryDataPoint[]
+// ── Merge helpers ─────────────────────────────────────────────────────────────
+
 function mergeHistory(
   ...arrays: Partial<HistoryDataPoint>[][]
 ): HistoryDataPoint[] {
@@ -122,174 +118,87 @@ function mergeRoomHistory(
     }))
 }
 
-// ── public API ────────────────────────────────────────────────────────────────
+// ── Parsers ───────────────────────────────────────────────────────────────────
+
+function num(val: string | undefined, fallback = 0): number {
+  if (!val || val === "unavailable" || val === "unknown") return fallback
+  const n = parseFloat(val)
+  return isNaN(n) ? fallback : n
+}
+
+function numOrNull(val: string | undefined): number | null {
+  if (!val || val === "unavailable" || val === "unknown") return null
+  const n = parseFloat(val)
+  return isNaN(n) ? null : n
+}
+
+function parseDate(raw: string | undefined, fallback: Date): Date {
+  if (!raw || raw === "unavailable" || raw === "unknown") return fallback
+  const d = new Date(raw)
+  return isNaN(d.getTime()) ? fallback : d
+}
+
+function parseHarvestDate(raw: string | undefined, fallback: Date): Date {
+  if (!raw || raw === "unavailable") return fallback
+  const iso = new Date(raw)
+  if (!isNaN(iso.getTime())) return iso
+  const match = raw.match(/(\d+)\.\s*(\w+)/)
+  if (match) {
+    const months: Record<string, number> = {
+      Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+      Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+      Januar: 0, Februar: 1, März: 2, April: 3, Mai: 4, Juni: 5,
+      Juli: 6, August: 7, September: 8, Oktober: 9, November: 10, Dezember: 11,
+    }
+    const month = months[match[2]]
+    if (month !== undefined) {
+      return new Date(new Date().getFullYear(), month, parseInt(match[1]))
+    }
+  }
+  return fallback
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 export async function fetchHAData(): Promise<{
   vegie: GrowBoxData
   bloom: GrowBoxData
 }> {
-  // Fetch all states in parallel
-  const [
-    // Bloom climate
-    bloomTemp,
-    bloomHum,
-    // Vegie / Clones climate
-    vegieTemp,
-    vegieHum,
-    // Shared room CO2
-    co2Raw,
-    // Light – Bloom
-    bloomPpfd,
-    bloomDli,
-    bloomWatt,
-    // Light – Vegie/Clones
-    vegiePpfd,
-    vegieDli,
-    vegieWatt,
-    // Fan
-    bloomFan,
-    vegieFan,
-    // Soil moisture – Bloom (BFS1 + BFS4)
-    bloomSoil1,
-    bloomSoil2,
-    // Soil moisture – Vegie (BFS1 + BFS3)
-    vegieSoil1,
-    vegieSoil2,
-    // Watering timers (hours since last)
-    bloomLastWatering,
-    vegieLastWatering,
-    // Tank levels
-    tankBloom,
-    tankVegie,
-    // Dates
-    bloomStartRaw,
-    vegieStartRaw,
-    bloomHarvestRaw,
-    vegieHarvestRaw,
-    // Week numbers
-    bloomWeek,
-    vegieWeek,
-  ] = await Promise.all([
-    getState("sensor.hygrometer2_temperature"),
-    getState("sensor.hygrometer2_humidity"),
-    getState("sensor.hygrometer1_temperature"),
-    getState("sensor.hygrometer1_humidity"),
-    getState("sensor.pwm2_growbox_co2"),
-    getState("sensor.esp32_growbox_ppfd"),
-    getState("sensor.esp32_growbox_dli"),
-    getState("sensor.growlight_derzeitiger_verbrauch"),
-    getState("sensor.espclone_clones_ppfd"),
-    getState("sensor.espclone_growbox_dli"),
-    getState("sensor.clones_power"),
-    getState("sensor.pwm_abluftleistung_pid"),
-    getState("sensor.pwm2_abluftleistung_pid"),
-    getState("sensor.esp321_bodenfeuchtigkeit1"),   // bloom BFS1
-    getState("sensor.soilsensor1_soil_moisture"),   // bloom BFS4
-    getState("sensor.espclone_bodenfeuchtigkeit1"), // vegie BFS1
-    getState("sensor.bodensensoroutdoor_soil_moisture"), // vegie BFS3
-    getState("sensor.bloom_last_watering"),
-    getState("sensor.vegie_last_watering"),
-    getState("input_number.tankinhalt_bloom"),
-    getState("input_number.tankinhalt_vegie"),
-    getState("input_datetime.bluete_startdatum"),
-    getState("input_datetime.vegie_startdatum"),
-    getState("sensor.blute_erntezeitpunkt"),
-    getState("sensor.vegie_erntezeitpunkt"),
-    getState("sensor.blutewoche"),
-    getState("sensor.vegiewoche"),
-  ])
-
-  // Derived values
-  const bloomTempN = num(bloomTemp, 25)
-  const bloomHumN = num(bloomHum, 50)
-  const vegieTempN = num(vegieTemp, 22)
-  const vegieHumN = num(vegieHum, 65)
-  const co2N = num(co2Raw, 800)
-
-  // Tank: HA stores in Liters, max 50L → convert to percentage
-  const bloomTankPct = Math.round((num(tankBloom, 0) / 50) * 100)
-  const vegieTankPct = Math.round((num(tankVegie, 0) / 30) * 100)
-
-  // Soil: average of two sensors if both available
-  const bloomSoilN = Math.round(
-    (num(bloomSoil1, 50) + num(bloomSoil2, 50)) / 2
-  )
-  const vegieSoilN = Math.round(
-    (num(vegieSoil1, 50) + num(vegieSoil2, 50)) / 2
-  )
-
-  // Dates
   const now = new Date()
 
-  const parseDate = (raw: string, fallback: Date): Date => {
-    if (!raw || raw === "unavailable" || raw === "unknown") return fallback
-    const d = new Date(raw)
-    return isNaN(d.getTime()) ? fallback : d
-  }
+  const entityIds = [
+    "sensor.hygrometer2_temperature",
+    "sensor.hygrometer2_humidity",
+    "sensor.hygrometer1_temperature",
+    "sensor.hygrometer1_humidity",
+    "sensor.pwm2_growbox_co2",
+    "sensor.esp32_growbox_ppfd",
+    "sensor.esp32_growbox_dli",
+    "sensor.growlight_derzeitiger_verbrauch",
+    "sensor.espclone_clones_ppfd",
+    "sensor.espclone_growbox_dli",
+    "sensor.clones_power",
+    "sensor.pwm_abluftleistung_pid",
+    "sensor.pwm2_abluftleistung_pid",
+    "sensor.esp321_bodenfeuchtigkeit1",
+    "sensor.soilsensor1_soil_moisture",
+    "sensor.espclone_bodenfeuchtigkeit1",
+    "sensor.bodensensoroutdoor_soil_moisture",
+    "sensor.bloom_last_watering",
+    "sensor.vegie_last_watering",
+    "input_number.tankinhalt_bloom",
+    "input_number.tankinhalt_vegie",
+    "input_datetime.bluete_startdatum",
+    "input_datetime.vegie_startdatum",
+    "sensor.blute_erntezeitpunkt",
+    "sensor.vegie_erntezeitpunkt",
+    "sensor.blutewoche",
+    "sensor.vegiewoche",
+  ]
 
-  const bloomStart = parseDate(
-    bloomStartRaw,
-    new Date(now.getTime() - 1000 * 60 * 60 * 24 * 77)
-  )
-  const vegieStart = parseDate(
-    vegieStartRaw,
-    new Date(now.getTime() - 1000 * 60 * 60 * 24 * 84)
-  )
-
-  // Harvest date: HA returns formatted string like "03. May" or "2026-04-07"
-  // We parse sensor.blute_erntezeitpunkt / sensor.vegie_erntezeitpunkt
-  const parseHarvestDate = (raw: string): Date => {
-    if (!raw || raw === "unavailable") return new Date(now.getTime() + 1000 * 60 * 60 * 24 * 30)
-    // Try ISO format first
-    const iso = new Date(raw)
-    if (!isNaN(iso.getTime())) return iso
-    // Try "03. May" format
-    const match = raw.match(/(\d+)\.\s*(\w+)/)
-    if (match) {
-      const months: Record<string, number> = {
-        Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
-        Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
-        Januar: 0, Februar: 1, März: 2, April: 3, Mai: 4, Juni: 5,
-        Juli: 6, August: 7, September: 8, Oktober: 9, November: 10, Dezember: 11,
-      }
-      const month = months[match[2]]
-      if (month !== undefined) {
-        return new Date(now.getFullYear(), month, parseInt(match[1]))
-      }
-    }
-    return new Date(now.getTime() + 1000 * 60 * 60 * 24 * 30)
-  }
-
-  const bloomHarvest = parseHarvestDate(bloomHarvestRaw)
-  const vegieHarvest = parseHarvestDate(vegieHarvestRaw)
-
-  // Days since start
-  const bloomDays = Math.floor((now.getTime() - bloomStart.getTime()) / (1000 * 60 * 60 * 24))
-  const vegieDays = Math.floor((now.getTime() - vegieStart.getTime()) / (1000 * 60 * 60 * 24))
-
-  // Grow number from week sensor
-  const bloomWeekN = num(bloomWeek, 1)
-  const vegieWeekN = num(vegieWeek, 1)
-
-  // Last watering: HA gives hours since last watering
-  const bloomLastWateringH = num(bloomLastWatering, 24)
-  const vegieLastWateringH = num(vegieLastWatering, 24)
-  const bloomLastWateringDate = new Date(now.getTime() - bloomLastWateringH * 60 * 60 * 1000)
-  const vegieLastWateringDate = new Date(now.getTime() - vegieLastWateringH * 60 * 60 * 1000)
-
-  // Light on = wattage > 0
-  const bloomLightOn = num(bloomWatt, 0) > 5
-  const vegieLightOn = num(vegieWatt, 0) > 5
-
-  // Light cycle strings (derived from phase)
-  const bloomLightCycle = "12/12"
-  const vegieLightCycle = "18/6"
-
-  // Fetch history in parallel
-  const [
-    bTempHist, bHumHist, bDliHist, bSoilHist,
-    vTempHist, vHumHist, vDliHist, vSoilHist,
-  ] = await Promise.all([
+  const [states, bloomHistTemp, bloomHistHum, bloomHistDli, bloomHistSoil,
+    vegieHistTemp, vegieHistHum, vegieHistDli, vegieHistSoil] = await Promise.all([
+    getStates(entityIds),
     fetchHistory("sensor.hygrometer2_temperature", "temperature"),
     fetchHistory("sensor.hygrometer2_humidity", "humidity"),
     fetchHistory("sensor.esp32_growbox_dli", "dli"),
@@ -300,70 +209,105 @@ export async function fetchHAData(): Promise<{
     fetchHistory("sensor.espclone_bodenfeuchtigkeit1", "soilMoisture"),
   ])
 
+  const s = (id: string) => states[id]?.state
+
+  // ── Bloom ──────────────────────────────────────────────────────────────────
+  const bloomTempN = numOrNull(s("sensor.hygrometer2_temperature"))
+  const bloomHumN  = numOrNull(s("sensor.hygrometer2_humidity"))
+  const bloomTempSafe = bloomTempN ?? 0
+  const bloomHumSafe  = bloomHumN  ?? 0
+  const bloomWatt   = num(s("sensor.growlight_derzeitiger_verbrauch"), 0)
+  const bloomTankPct = Math.min(100, Math.round((num(s("input_number.tankinhalt_bloom"), 0) / 50) * 100))
+  const bloomSoil = Math.round((num(s("sensor.esp321_bodenfeuchtigkeit1"), 50) + num(s("sensor.soilsensor1_soil_moisture"), 50)) / 2)
+  const bloomLastWH = num(s("sensor.bloom_last_watering"), 24)
+  const bloomLastWDate = new Date(now.getTime() - bloomLastWH * 3600000)
+  const bloomStart  = parseDate(s("input_datetime.bluete_startdatum"), new Date(now.getTime() - 77 * 86400000))
+  const bloomHarvest = parseHarvestDate(s("sensor.blute_erntezeitpunkt"), new Date(now.getTime() + 30 * 86400000))
+  const bloomWeekN  = num(s("sensor.blutewoche"), 1)
   const bloomHistory = mergeHistory(
-    bTempHist as Partial<HistoryDataPoint>[],
-    bHumHist as Partial<HistoryDataPoint>[],
-    bDliHist as Partial<HistoryDataPoint>[],
-    bSoilHist as Partial<HistoryDataPoint>[]
+    bloomHistTemp as Partial<HistoryDataPoint>[],
+    bloomHistHum  as Partial<HistoryDataPoint>[],
+    bloomHistDli  as Partial<HistoryDataPoint>[],
+    bloomHistSoil as Partial<HistoryDataPoint>[],
   )
 
+  // ── Vegie ──────────────────────────────────────────────────────────────────
+  const vegieTempN = numOrNull(s("sensor.hygrometer1_temperature"))
+  const vegieHumN  = numOrNull(s("sensor.hygrometer1_humidity"))
+  const vegieTempSafe = vegieTempN ?? 0
+  const vegieHumSafe  = vegieHumN  ?? 0
+  const vegieWatt   = num(s("sensor.clones_power"), 0)
+  const vegieTankPct = Math.min(100, Math.round((num(s("input_number.tankinhalt_vegie"), 0) / 30) * 100))
+  const vegieSoil = Math.round((num(s("sensor.espclone_bodenfeuchtigkeit1"), 50) + num(s("sensor.bodensensoroutdoor_soil_moisture"), 50)) / 2)
+  const vegieLastWH = num(s("sensor.vegie_last_watering"), 24)
+  const vegieLastWDate = new Date(now.getTime() - vegieLastWH * 3600000)
+  const vegieStart  = parseDate(s("input_datetime.vegie_startdatum"), new Date(now.getTime() - 84 * 86400000))
+  const vegieHarvest = parseHarvestDate(s("sensor.vegie_erntezeitpunkt"), new Date(now.getTime() + 30 * 86400000))
+  const vegieWeekN  = num(s("sensor.vegiewoche"), 1)
   const vegieHistory = mergeHistory(
-    vTempHist as Partial<HistoryDataPoint>[],
-    vHumHist as Partial<HistoryDataPoint>[],
-    vDliHist as Partial<HistoryDataPoint>[],
-    vSoilHist as Partial<HistoryDataPoint>[]
+    vegieHistTemp as Partial<HistoryDataPoint>[],
+    vegieHistHum  as Partial<HistoryDataPoint>[],
+    vegieHistDli  as Partial<HistoryDataPoint>[],
+    vegieHistSoil as Partial<HistoryDataPoint>[],
   )
+
+  const co2N = num(s("sensor.pwm2_growbox_co2"), 0)
 
   const bloom: GrowBoxData = {
     id: "bloom-box",
     name: "Bloom",
     phase: "bloom",
     growNumber: Math.ceil(bloomWeekN / 8) || 1,
-    temperature: bloomTempN,
-    humidity: bloomHumN,
-    vpd: calculateVPD(bloomTempN, bloomHumN),
+    temperature: bloomTempSafe,
+    humidity: bloomHumSafe,
+    vpd: bloomTempN !== null && bloomHumN !== null ? calculateVPD(bloomTempSafe, bloomHumSafe) : 0,
     co2: co2N,
-    soilMoisture: bloomSoilN,
-    lightCycle: bloomLightCycle,
-    ppfd: num(bloomPpfd, 0),
-    dli: num(bloomDli, 0),
-    wattage: num(bloomWatt, 0),
+    soilMoisture: bloomSoil,
+    lightCycle: "12/12",
+    ppfd: num(s("sensor.esp32_growbox_ppfd"), 0),
+    dli: num(s("sensor.esp32_growbox_dli"), 0),
+    wattage: bloomWatt,
     waterTankLevel: bloomTankPct,
-    lastWatering: bloomLastWateringDate,
-    nextWatering: new Date(bloomLastWateringDate.getTime() + 1000 * 60 * 60 * 24),
-    daysSinceStart: bloomDays,
+    lastWatering: bloomLastWDate,
+    nextWatering: new Date(bloomLastWDate.getTime() + 86400000),
+    daysSinceStart: Math.floor((now.getTime() - bloomStart.getTime()) / 86400000),
     harvestDate: bloomHarvest,
     bloomStartDate: bloomStart,
-    fanSpeed: Math.round(num(bloomFan, 0)),
+    fanSpeed: Math.round(num(s("sensor.pwm_abluftleistung_pid"), 0)),
     targetHumidity: 50,
-    lightOn: bloomLightOn,
-    alerts: [],
+    lightOn: bloomWatt > 5,
+    alerts: bloomTempN === null ? [{
+      id: "bloom-sensor-offline",
+      type: "warning" as const,
+      message: "Hygrometer Bloom offline",
+      timestamp: now,
+    }] : [],
     history: bloomHistory,
   }
 
   const vegie: GrowBoxData = {
     id: "vegie-box",
-    name: "Vegie",
+    name: "Vegie / Clones",
     phase: "vegie",
     growNumber: Math.ceil(vegieWeekN / 8) || 1,
-    temperature: vegieTempN,
-    humidity: vegieHumN,
-    vpd: calculateVPD(vegieTempN, vegieHumN),
+    temperature: vegieTempSafe,
+    humidity: vegieHumSafe,
+    vpd: vegieTempN !== null && vegieHumN !== null ? calculateVPD(vegieTempSafe, vegieHumSafe) : 0,
     co2: co2N,
-    soilMoisture: vegieSoilN,
-    lightCycle: vegieLightCycle,
-    ppfd: num(vegiePpfd, 0),
-    dli: num(vegieDli, 0),
-    wattage: num(vegieWatt, 0),
+    soilMoisture: vegieSoil,
+    lightCycle: "18/6",
+    ppfd: num(s("sensor.espclone_clones_ppfd"), 0),
+    dli: num(s("sensor.espclone_growbox_dli"), 0),
+    wattage: vegieWatt,
     waterTankLevel: vegieTankPct,
-    lastWatering: vegieLastWateringDate,
-    nextWatering: new Date(vegieLastWateringDate.getTime() + 1000 * 60 * 60 * 24),
-    daysSinceStart: vegieDays,
+    lastWatering: vegieLastWDate,
+    nextWatering: new Date(vegieLastWDate.getTime() + 86400000),
+    daysSinceStart: Math.floor((now.getTime() - vegieStart.getTime()) / 86400000),
     harvestDate: vegieHarvest,
-    bloomStartDate: vegieHarvest, // for vegie: bloomStartDate = when bloom phase starts = harvest estimate
-    fanSpeed: Math.round(num(vegieFan, 0)),
+    bloomStartDate: vegieHarvest,
+    fanSpeed: Math.round(num(s("sensor.pwm2_abluftleistung_pid"), 0)),
     targetHumidity: 65,
-    lightOn: vegieLightOn,
+    lightOn: vegieWatt > 5,
     alerts: [],
     history: vegieHistory,
   }
@@ -372,61 +316,42 @@ export async function fetchHAData(): Promise<{
 }
 
 export async function fetchHARoomData(): Promise<RoomData> {
-  const [roomTemp, roomHum, co2Raw, heatingState, acState, acTemp] =
+  const entityIds = [
+    "sensor.hygrometera_temperature",
+    "sensor.pwm2_growbox_luftfeuchtigkeit",
+    "sensor.pwm2_growbox_co2",
+    "switch.heizung",
+  ]
+
+  const [states, heizungAttrs, acAttrs, rTempHist, rHumHist, rCo2Hist] =
     await Promise.all([
-      getState("sensor.hygrometera_temperature"),
-      getState("sensor.pwm2_growbox_luftfeuchtigkeit"),
-      getState("sensor.pwm2_growbox_co2"),
-      getState("switch.heizung"),
-      getState("climate.152832117146580_climate"),
-      getState("climate.152832117146580_climate"), // we parse attributes separately
+      getStates(entityIds),
+      getAttributes("climate.heizung"),
+      getAttributes("climate.152832117146580_climate"),
+      fetchHistory("sensor.hygrometera_temperature", "temperature"),
+      fetchHistory("sensor.pwm2_growbox_luftfeuchtigkeit", "humidity"),
+      fetchHistory("sensor.pwm2_growbox_co2", "co2"),
     ])
 
-  // For AC target temp we need attributes – do a separate fetch
-  let acTargetTemp = 24
-  try {
-    const res = await fetch(`${HA_URL}/api/states/climate.152832117146580_climate`, {
-      headers: { Authorization: `Bearer ${HA_TOKEN}` },
-      cache: "no-store",
-    })
-    if (res.ok) {
-      const json = await res.json()
-      acTargetTemp = json.attributes?.temperature ?? 24
-    }
-  } catch {}
-
-  let heatingTargetTemp = 22
-  try {
-    const res = await fetch(`${HA_URL}/api/states/climate.heizung`, {
-      headers: { Authorization: `Bearer ${HA_TOKEN}` },
-      cache: "no-store",
-    })
-    if (res.ok) {
-      const json = await res.json()
-      heatingTargetTemp = json.attributes?.temperature ?? 22
-    }
-  } catch {}
-
-  const [rTempHist, rHumHist, rCo2Hist] = await Promise.all([
-    fetchHistory("sensor.hygrometera_temperature", "temperature"),
-    fetchHistory("sensor.pwm2_growbox_luftfeuchtigkeit", "humidity"),
-    fetchHistory("sensor.pwm2_growbox_co2", "co2"),
-  ])
+  const s = (id: string) => states[id]?.state
 
   const history = mergeRoomHistory(
     rTempHist as Partial<RoomHistoryPoint>[],
-    rHumHist as Partial<RoomHistoryPoint>[],
-    rCo2Hist as Partial<RoomHistoryPoint>[]
+    rHumHist  as Partial<RoomHistoryPoint>[],
+    rCo2Hist  as Partial<RoomHistoryPoint>[],
   )
 
   return {
-    heatingOn: heatingState === "on",
-    heatingTemp: heatingTargetTemp,
-    acOn: acState !== "off" && acState !== "unavailable",
-    acTemp: acTargetTemp,
-    roomTemp: num(roomTemp, 22),
-    roomHumidity: num(roomHum, 55),
-    co2: num(co2Raw, 800),
+    heatingOn: s("switch.heizung") === "on",
+    heatingTemp: (heizungAttrs.temperature as number) ?? 22,
+    acOn: (() => {
+      const st = s("climate.152832117146580_climate") ?? "off"
+      return st !== "off" && st !== "unavailable"
+    })(),
+    acTemp: (acAttrs.temperature as number) ?? 24,
+    roomTemp: num(s("sensor.hygrometera_temperature"), 0),
+    roomHumidity: num(s("sensor.pwm2_growbox_luftfeuchtigkeit"), 0),
+    co2: num(s("sensor.pwm2_growbox_co2"), 0),
     history,
   }
 }
